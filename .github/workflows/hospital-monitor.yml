@@ -10,10 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Chrome 설치
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-driver
+      
       - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+      
       - run: pip install -r requirements.txt
+      
       - env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python monitor_hospital.py
