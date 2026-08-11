@@ -14,23 +14,40 @@
 
 ## 설정 바꾸기
 
-`config.json` 만 고치면 됩니다.
+`config.json` 의 `targets` 배열에 병원을 하나씩 추가합니다. 여러 곳을 동시에 감시할 수 있습니다.
 
 ```json
 {
-  "booking_url": "https://booking.naver.com/booking/13/bizes/448698/items/3707473",
-  "date_start": "2026-08-11",
-  "date_end":   "2026-08-31",
-  "weekdays":   ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-  "time_start": "13:00",
-  "time_end":   "20:00",
-  "max_dates_per_run": 25
+  "targets": [
+    {
+      "name": "병원1",
+      "booking_url": "https://booking.naver.com/booking/13/bizes/448698/items/3707473",
+      "date_start": "2026-08-11",
+      "date_end":   "2026-08-31",
+      "weekdays":   ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+      "time_start": "13:00",
+      "time_end":   "20:00",
+      "max_dates_per_run": 25
+    },
+    {
+      "name": "병원2",
+      "booking_url": "https://booking.naver.com/booking/13/bizes/1163916/items/5909793",
+      "date_start": "2026-08-11",
+      "date_end":   "2026-08-31",
+      "weekdays":   ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+      "time_start": "13:00",
+      "time_end":   "20:00",
+      "max_dates_per_run": 25
+    }
+  ]
 }
 ```
 
+- `name` — Slack 알림에 표시될 이름 (병원 구분용, 원하는 대로 변경 가능)
 - `weekdays` — 평일만 원하면 `["Mon","Tue","Wed","Thu","Fri"]`
 - `time_start` / `time_end` — 이 사이에 있는 시간만 알림
 - `max_dates_per_run` — 한 번에 확인할 최대 날짜 수 (많을수록 실행이 오래 걸림)
+- 병원을 더 추가하려면 `targets` 배열에 객체를 하나 더 넣으면 됩니다
 
 ## 확인 주기 바꾸기
 

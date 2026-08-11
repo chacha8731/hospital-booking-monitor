@@ -225,18 +225,21 @@ def send_slack(text, blocks=None):
         return False
 
 
-def notify_new_slots(new_slots, booking_url):
+def notify_new_slots(name, new_slots, booking_url):
     lines = [
         f"*{d}* ({WEEKDAYS[date.fromisoformat(d).weekday()]})  {', '.join(times)}"
         for d, times in sorted(new_slots.items())
     ]
     body = "\n".join(lines)
     return send_slack(
-        f"🏥 병원 예약 빈자리 {sum(len(v) for v in new_slots.values())}건 발견",
+        f"🏥 [{name}] 예약 빈자리 {sum(len(v) for v in new_slots.values())}건 발견",
         blocks=[
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*🏥 빈자리가 났습니다!*\n\n{body}"},
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*🏥 [{name}] 빈자리가 났습니다!*\n\n{body}",
+                },
             },
             {
                 "type": "actions",
@@ -252,31 +255,81 @@ def notify_new_slots(new_slots, booking_url):
     )
 
 
+def safe_filename(text):
+    return re.sub(r"[^0-9A-Za-z가-힣_-]+", "_", text).strip("_") or "target"
+
+
+def run_target(page, target, previous_state, debug_all):
+    name = target.get("name") or target["booking_url"]
+    booking_url = target["booking_url"]
+    days = target_dates(target)
+
+    log("-" * 60)
+    log(f"[{name}]")
+    log(f"  기간   : {target['date_start']} ~ {target['date_end']}")
+    log(f"  시간   : {target.get('time_start')} ~ {target.get('time_end')}")
+    log(f"  요일   : {', '.join(target.get('weekdays', WEEKDAYS))}")
+    log(f"  대상일 : {len(days)}일")
+
+    debug = {"name": name, "dates": []}
+    debug_all.append(debug)
+    found = {}
+
+    if not days:
+        log("  확인할 날짜가 없습니다. (기간이 이미 지났는지 확인하세요)")
+        return name, found, 0, {}
+
+    for i, day in enumerate(days):
+        try:
+            times = scan_date(page, booking_url, day, target, debug)
+            if times:
+                found[day.isoformat()] = times
+            if i == 0:
+                stem = safe_filename(name)
+                page.screenshot(
+                    path=str(DEBUG_DIR / f"{stem}_first_date.png"), full_page=True
+                )
+                (DEBUG_DIR / f"{stem}_first_date.html").write_text(
+                    page.content(), encoding="utf-8"
+                )
+        except Exception as e:
+            log(f"  {day} 확인 실패: {e}")
+            debug["dates"].append({"date": day.isoformat(), "error": str(e)})
+
+    total_collected = sum(d.get("collected", 0) for d in debug["dates"])
+    previous = previous_state.get(name, {})
+    new_slots = {}
+    for day_str, times in found.items():
+        fresh = sorted(set(times) - set(previous.get(day_str, [])))
+        if fresh:
+            new_slots[day_str] = fresh
+
+    log(f"  수집 {total_collected}개 | 빈자리 {sum(len(v) for v in found.values())}건 | 신규 {sum(len(v) for v in new_slots.values())}건")
+
+    if new_slots:
+        notify_new_slots(name, new_slots, booking_url)
+
+    return name, found, total_collected, new_slots
+
+
 def main():
     DEBUG_DIR.mkdir(exist_ok=True)
     cfg = read_json(CONFIG_FILE, None)
-    if not cfg:
-        log("config.json 을 읽지 못했습니다.")
+    targets = (cfg or {}).get("targets") or []
+    if not targets:
+        log("config.json 에 targets 가 없습니다.")
         return 1
 
-    booking_url = cfg["booking_url"]
-    days = target_dates(cfg)
-
     log("=" * 60)
-    log("네이버 예약 빈자리 모니터")
-    log(f"  기간   : {cfg['date_start']} ~ {cfg['date_end']}")
-    log(f"  시간   : {cfg.get('time_start')} ~ {cfg.get('time_end')}")
-    log(f"  요일   : {', '.join(cfg.get('weekdays', WEEKDAYS))}")
-    log(f"  대상일 : {len(days)}일")
-    log(f"  Slack  : {'설정됨' if SLACK_WEBHOOK_URL else '미설정'}")
+    log(f"네이버 예약 빈자리 모니터 — 감시 대상 {len(targets)}곳")
+    log(f"Slack  : {'설정됨' if SLACK_WEBHOOK_URL else '미설정'}")
     log("=" * 60)
 
-    if not days:
-        log("확인할 날짜가 없습니다. (기간이 이미 지났는지 확인하세요)")
-        return 0
-
-    debug = {"run_at": datetime.now().isoformat(timespec="seconds"), "dates": []}
-    found = {}
+    previous_state = read_json(STATE_FILE, {})
+    debug_all = []
+    new_state = {}
+    any_new = False
+    total_collected_all = 0
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -291,61 +344,37 @@ def main():
         )
         page = context.new_page()
 
-        for i, day in enumerate(days):
-            try:
-                times = scan_date(page, booking_url, day, cfg, debug)
-                if times:
-                    found[day.isoformat()] = times
-                # 첫 날짜는 화면을 남겨 페이지가 제대로 떴는지 확인할 수 있게 한다
-                if i == 0:
-                    page.screenshot(
-                        path=str(DEBUG_DIR / "first_date.png"), full_page=True
-                    )
-                    (DEBUG_DIR / "first_date.html").write_text(
-                        page.content(), encoding="utf-8"
-                    )
-            except Exception as e:
-                log(f"  {day} 확인 실패: {e}")
-                debug["dates"].append({"date": day.isoformat(), "error": str(e)})
+        for target in targets:
+            name, found, collected, new_slots = run_target(
+                page, target, previous_state, debug_all
+            )
+            new_state[name] = found
+            total_collected_all += collected
+            if new_slots:
+                any_new = True
 
         context.close()
         browser.close()
 
-    write_json(DEBUG_DIR / "scan.json", debug)
+    write_json(DEBUG_DIR / "scan.json", {"run_at": datetime.now().isoformat(timespec="seconds"), "targets": debug_all})
 
-    total_collected = sum(d.get("collected", 0) for d in debug["dates"])
-    previous = read_json(STATE_FILE, {})
-
-    # 이전에 없던 날짜, 또는 이전에 없던 시간만 "새 자리"로 본다
-    new_slots = {}
-    for day_str, times in found.items():
-        fresh = sorted(set(times) - set(previous.get(day_str, [])))
-        if fresh:
-            new_slots[day_str] = fresh
-
-    log("-" * 60)
-    log(f"수집한 시간 텍스트 총 {total_collected}개")
-    log(f"조건에 맞는 빈자리 : {sum(len(v) for v in found.values())}건")
-    log(f"그중 새로 생긴 것  : {sum(len(v) for v in new_slots.values())}건")
-
-    if new_slots:
-        notify_new_slots(new_slots, booking_url)
-    elif ALWAYS_NOTIFY:
-        if total_collected == 0:
+    if not any_new and ALWAYS_NOTIFY:
+        if total_collected_all == 0:
             msg = (
                 "⚙️ *모니터 점검 실행*\n"
-                "정상 실행됐지만 페이지에서 시간표를 찾지 못했습니다.\n"
+                f"감시 대상 {len(targets)}곳 모두 정상 실행됐지만 시간표를 찾지 못했습니다.\n"
                 "지금 예약이 마감(닫힘) 상태라면 정상입니다."
             )
         else:
             msg = (
                 "⚙️ *모니터 점검 실행*\n"
-                f"시간표 {total_collected}개를 읽었고, 조건에 맞는 빈자리는 없습니다.\n"
+                f"감시 대상 {len(targets)}곳, 시간표 {total_collected_all}개를 읽었고 조건에 맞는 빈자리는 없습니다.\n"
                 "감시는 정상 동작 중입니다."
             )
         send_slack("⚙️ 모니터 점검 실행", blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": msg}}])
 
-    write_json(STATE_FILE, found)
+    write_json(STATE_FILE, new_state)
+    log("=" * 60)
     log("완료")
     return 0
 
