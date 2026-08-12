@@ -5,7 +5,9 @@
 동작 방식
   1) config.json 의 기간/요일 조건에 맞는 날짜 목록을 만든다
   2) 각 날짜마다 예약 페이지를 ?startDate=YYYY-MM-DD 로 직접 연다
-  3) 페이지 안에서 "13:30" 같은 시간 형태 텍스트를 가진 요소를 전부 수집한다
+  3) 페이지 안에서 "13:30" 또는 "1:30"(+ 별도의 "오전"/"오후" 제목) 형태의
+     시간 텍스트를 가진 요소를 전부 수집한다. 12시간 형식인 업체는 문서 순서상
+     직전에 지나친 "오전"/"오후" 제목을 붙여 24시간제로 환산한다
   4) 비활성(disabled 속성 / 마감 계열 클래스)인지, 아니면 글자색이 회색인지로
      예약 가능 여부를 판별한다  (검정 = 가능, 회색 = 마감)
   5) 이전 실행 결과(booking_state.json)와 비교해 새로 생긴 자리만 Slack 알림
@@ -46,13 +48,33 @@ USER_AGENT = (
 
 # 페이지 안에서 실행되는 수집 스크립트.
 # 시간 형태 텍스트를 가진 "가장 안쪽" 요소만 골라, 클릭 가능한 조상과 함께 상태를 읽는다.
+# 네이버 예약은 업체마다 "13:30"(24시간) 또는 "1:30"+"오전/오후"(12시간, 구간 제목 분리)
+# 두 형식을 섞어 쓰므로, 문서 순서대로 훑으며 "오전/오후" 제목을 지나칠 때마다
+# 이후 시간에 그 구간(period)을 붙여준다.
 JS_COLLECT = r"""
 () => {
   const TIME = /^\d{1,2}:\d{2}$/;
+  const PERIOD = /^(오전|오후|AM|PM)$/i;
   const out = [];
   const seen = new Set();
+  let period = null;
 
-  for (const el of document.querySelectorAll('button, a, li, td, div, span, label, p, strong, em')) {
+  const nodes = document.querySelectorAll(
+    'button, a, li, td, div, span, label, p, strong, em, h1, h2, h3, h4, h5, h6'
+  );
+
+  for (const el of nodes) {
+    // 이 요소 자신의 텍스트만 본다 (자식 텍스트는 제외) -> "오전/오후" 제목 판별용
+    let ownText = '';
+    for (const n of el.childNodes) {
+      if (n.nodeType === 3) ownText += n.textContent;
+    }
+    ownText = ownText.trim();
+    if (PERIOD.test(ownText)) {
+      period = /오후|pm/i.test(ownText) ? 'PM' : 'AM';
+      continue;
+    }
+
     const text = (el.innerText || '').trim();
     if (!TIME.test(text)) continue;
 
@@ -78,6 +100,7 @@ JS_COLLECT = r"""
 
     out.push({
       time: text,
+      period: period,
       disabled: !!disabled,
       color: getComputedStyle(el).color,
       cls: cls.trim().slice(0, 160),
@@ -124,13 +147,30 @@ def target_dates(cfg):
     return days
 
 
-def normalize_time(text):
+def normalize_time(text, period=None, window=None):
+    """'4:00' + period='PM' -> '16:00'. period가 없으면 감시 시간대(window)에
+    맞춰 오전/오후 중 그럴듯한 쪽을 고른다. 그래도 못 정하면 원문 그대로 둔다."""
     m = TIME_TEXT.match(text)
     if not m:
         return None
     hour, minute = int(m.group(1)), m.group(2)
     if hour > 23:
         return None
+
+    if hour <= 12 and period in ("AM", "PM"):
+        if period == "PM" and hour != 12:
+            hour += 12
+        elif period == "AM" and hour == 12:
+            hour = 0
+    elif hour <= 12 and window:
+        lo_h = int(window[0].split(":")[0])
+        hi_h = int(window[1].split(":")[0])
+        pm_hour = hour if hour == 12 else hour + 12
+        as_is_in_window = lo_h <= hour <= hi_h
+        pm_in_window = lo_h <= pm_hour <= hi_h
+        if pm_in_window and not as_is_in_window:
+            hour = pm_hour
+
     return f"{hour:02d}:{minute}"
 
 
@@ -189,7 +229,9 @@ def scan_date(page, base_url, day, cfg, debug):
     times = sorted(
         {
             t
-            for t in (normalize_time(s["time"]) for s in available)
+            for t in (
+                normalize_time(s["time"], s.get("period"), (lo, hi)) for s in available
+            )
             if t and lo <= t <= hi
         }
     )
