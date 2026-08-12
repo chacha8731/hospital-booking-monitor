@@ -4,7 +4,7 @@
 
 동작 방식
   1) config.json 의 기간/요일 조건에 맞는 날짜 목록을 만든다
-  2) 각 날짜마다 예약 페이지를 ?startDate=YYYY-MM-DD 로 직접 연다
+  2) 각 날짜마다 예약 페이지를 ?startDate=YYYY-MM-DD 로 직접 연다 (여러 날짜를 동시에 열어 속도를 낸다)
   3) 페이지 안에서 "13:30" 또는 "1:30"(+ 별도의 "오전"/"오후" 제목) 형태의
      시간 텍스트를 가진 요소를 전부 수집한다. 12시간 형식인 업체는 문서 순서상
      직전에 지나친 "오전"/"오후" 제목을 붙여 24시간제로 환산한다
@@ -17,6 +17,7 @@ CSS 선택자를 지정하지 않으므로 네이버가 클래스명을 바꿔�
 결과가 이상하면 그 파일만 보면 원인을 알 수 있다.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -26,7 +27,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
@@ -37,6 +38,11 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 # 수동 실행(workflow_dispatch)일 때는 빈자리가 없어도 결과 요약을 Slack 으로 보낸다.
 # -> 알림 배관이 살아있는지 사용자가 눈으로 확인할 수 있게 하기 위함
 ALWAYS_NOTIFY = os.environ.get("ALWAYS_NOTIFY", "0") == "1"
+
+# 같은 브라우저 안에서 동시에 열어 둘 날짜 페이지 수.
+# 하나씩 순서대로 열면 (날짜 수 x 업체 수) 만큼 그대로 시간이 누적되므로,
+# 페이지를 여러 개 동시에 띄워 전체 실행 시간을 줄인다.
+CONCURRENCY = int(os.environ.get("MONITOR_CONCURRENCY", "6"))
 
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 TIME_TEXT = re.compile(r"^(\d{1,2}):(\d{2})$")
@@ -204,25 +210,37 @@ def split_available(raw_slots):
     return list(raw_slots), "unknown"
 
 
-def scan_date(page, base_url, day, cfg, debug):
-    """하루치 페이지를 열어 예약 가능한 시간 목록을 반환"""
+async def scan_date(context, base_url, day, cfg, take_screenshot_to=None):
+    """하루치 페이지를 새 탭에서 열어 예약 가능한 시간 목록을 반환.
+    페이지를 이 함수 안에서 열고 닫으므로, 여러 날짜를 동시에 돌려도 서로 간섭하지 않는다."""
     sep = "&" if "?" in base_url else "?"
     url = f"{base_url}{sep}startDate={day.isoformat()}"
 
-    page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-
-    # 시간 텍스트가 하나라도 그려질 때까지 대기 (없으면 그대로 진행)
+    page = await context.new_page()
     try:
-        page.wait_for_function(
-            "() => [...document.querySelectorAll('button, a, li, td, div, span')]"
-            ".some(e => /^\\d{1,2}:\\d{2}$/.test((e.innerText || '').trim()))",
-            timeout=12_000,
-        )
-    except Exception:
-        pass
-    page.wait_for_timeout(1_500)
+        await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
 
-    raw = page.evaluate(JS_COLLECT)
+        # 시간 텍스트가 하나라도 그려질 때까지 대기 (없으면 그대로 진행)
+        try:
+            await page.wait_for_function(
+                "() => [...document.querySelectorAll('button, a, li, td, div, span')]"
+                ".some(e => /^\\d{1,2}:\\d{2}$/.test((e.innerText || '').trim()))",
+                timeout=10_000,
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(800)
+
+        raw = await page.evaluate(JS_COLLECT)
+
+        if take_screenshot_to:
+            await page.screenshot(path=str(take_screenshot_to) + ".png", full_page=True)
+            (Path(str(take_screenshot_to) + ".html")).write_text(
+                await page.content(), encoding="utf-8"
+            )
+    finally:
+        await page.close()
+
     available, mode = split_available(raw)
 
     lo, hi = cfg.get("time_start", "00:00"), cfg.get("time_end", "23:59")
@@ -236,18 +254,16 @@ def scan_date(page, base_url, day, cfg, debug):
         }
     )
 
-    debug["dates"].append(
-        {
-            "date": day.isoformat(),
-            "url": url,
-            "collected": len(raw),
-            "mode": mode,
-            "available_in_window": times,
-            "sample": raw[:12],
-        }
-    )
+    entry = {
+        "date": day.isoformat(),
+        "url": url,
+        "collected": len(raw),
+        "mode": mode,
+        "available_in_window": times,
+        "sample": raw[:12],
+    }
     log(f"  {day} | 수집 {len(raw):>3}개 | 판별 {mode:<9} | 조건내 가능 {len(times)}개 {times}")
-    return times
+    return times, entry
 
 
 def send_slack(text, blocks=None):
@@ -301,7 +317,7 @@ def safe_filename(text):
     return re.sub(r"[^0-9A-Za-z가-힣_-]+", "_", text).strip("_") or "target"
 
 
-def run_target(page, target, previous_state, debug_all):
+async def run_target(context, target, previous_state, semaphore):
     name = target.get("name") or target["booking_url"]
     booking_url = target["booking_url"]
     days = target_dates(target)
@@ -311,32 +327,34 @@ def run_target(page, target, previous_state, debug_all):
     log(f"  기간   : {target['date_start']} ~ {target['date_end']}")
     log(f"  시간   : {target.get('time_start')} ~ {target.get('time_end')}")
     log(f"  요일   : {', '.join(target.get('weekdays', WEEKDAYS))}")
-    log(f"  대상일 : {len(days)}일")
+    log(f"  대상일 : {len(days)}일 (동시 {CONCURRENCY}개씩 확인)")
 
     debug = {"name": name, "dates": []}
-    debug_all.append(debug)
-    found = {}
 
     if not days:
         log("  확인할 날짜가 없습니다. (기간이 이미 지났는지 확인하세요)")
-        return name, found, 0, {}
+        return name, {}, 0, {}, debug
 
-    for i, day in enumerate(days):
-        try:
-            times = scan_date(page, booking_url, day, target, debug)
-            if times:
-                found[day.isoformat()] = times
-            if i == 0:
-                stem = safe_filename(name)
-                page.screenshot(
-                    path=str(DEBUG_DIR / f"{stem}_first_date.png"), full_page=True
-                )
-                (DEBUG_DIR / f"{stem}_first_date.html").write_text(
-                    page.content(), encoding="utf-8"
-                )
-        except Exception as e:
-            log(f"  {day} 확인 실패: {e}")
-            debug["dates"].append({"date": day.isoformat(), "error": str(e)})
+    stem = safe_filename(name)
+
+    async def bound_scan(day, is_first):
+        async with semaphore:
+            shot = DEBUG_DIR / f"{stem}_first_date" if is_first else None
+            try:
+                return day, await scan_date(context, booking_url, day, target, shot)
+            except Exception as e:
+                log(f"  {day} 확인 실패: {e}")
+                return day, (None, {"date": day.isoformat(), "error": str(e)})
+
+    results = await asyncio.gather(
+        *(bound_scan(day, i == 0) for i, day in enumerate(days))
+    )
+
+    found = {}
+    for day, (times, entry) in sorted(results, key=lambda r: r[0]):
+        debug["dates"].append(entry)
+        if times:
+            found[day.isoformat()] = times
 
     total_collected = sum(d.get("collected", 0) for d in debug["dates"])
     previous = previous_state.get(name, {})
@@ -346,15 +364,18 @@ def run_target(page, target, previous_state, debug_all):
         if fresh:
             new_slots[day_str] = fresh
 
-    log(f"  수집 {total_collected}개 | 빈자리 {sum(len(v) for v in found.values())}건 | 신규 {sum(len(v) for v in new_slots.values())}건")
+    log(
+        f"  수집 {total_collected}개 | 빈자리 {sum(len(v) for v in found.values())}건 "
+        f"| 신규 {sum(len(v) for v in new_slots.values())}건"
+    )
 
     if new_slots:
         notify_new_slots(name, new_slots, booking_url)
 
-    return name, found, total_collected, new_slots
+    return name, found, total_collected, new_slots, debug
 
 
-def main():
+async def main_async():
     DEBUG_DIR.mkdir(exist_ok=True)
     cfg = read_json(CONFIG_FILE, None)
     targets = (cfg or {}).get("targets") or []
@@ -373,32 +394,38 @@ def main():
     any_new = False
     total_collected_all = 0
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
+    # 날짜 페이지 동시 개수를 이 세마포어로 제한한다 (한 브라우저 안에서 탭만 여러 개 연다).
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-        context = browser.new_context(
+        context = await browser.new_context(
             user_agent=USER_AGENT,
             locale="ko-KR",
             timezone_id="Asia/Seoul",
             viewport={"width": 1280, "height": 1600},
         )
-        page = context.new_page()
 
         for target in targets:
-            name, found, collected, new_slots = run_target(
-                page, target, previous_state, debug_all
+            name, found, collected, new_slots, debug = await run_target(
+                context, target, previous_state, semaphore
             )
             new_state[name] = found
             total_collected_all += collected
+            debug_all.append(debug)
             if new_slots:
                 any_new = True
 
-        context.close()
-        browser.close()
+        await context.close()
+        await browser.close()
 
-    write_json(DEBUG_DIR / "scan.json", {"run_at": datetime.now().isoformat(timespec="seconds"), "targets": debug_all})
+    write_json(
+        DEBUG_DIR / "scan.json",
+        {"run_at": datetime.now().isoformat(timespec="seconds"), "targets": debug_all},
+    )
 
     if not any_new and ALWAYS_NOTIFY:
         if total_collected_all == 0:
@@ -413,12 +440,19 @@ def main():
                 f"감시 대상 {len(targets)}곳, 시간표 {total_collected_all}개를 읽었고 조건에 맞는 빈자리는 없습니다.\n"
                 "감시는 정상 동작 중입니다."
             )
-        send_slack("⚙️ 모니터 점검 실행", blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": msg}}])
+        send_slack(
+            "⚙️ 모니터 점검 실행",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": msg}}],
+        )
 
     write_json(STATE_FILE, new_state)
     log("=" * 60)
     log("완료")
     return 0
+
+
+def main():
+    return asyncio.run(main_async())
 
 
 if __name__ == "__main__":

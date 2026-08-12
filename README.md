@@ -54,12 +54,28 @@
 `.github/workflows/monitor.yml` 의 `cron` 값:
 
 ```yaml
-- cron: '*/10 * * * *'   # 10분마다 (기본)
-- cron: '*/5 * * * *'    # 5분마다
+- cron: '*/20 * * * *'   # 20분마다 (기본)
+- cron: '*/10 * * * *'   # 10분마다
 - cron: '0 * * * *'      # 1시간마다
 ```
 
-GitHub 무료 cron 은 서버 부하에 따라 몇 분 늦게 실행될 수 있습니다. 정상입니다.
+GitHub 무료 cron 은 서버 부하에 따라 실제로는 설정보다 늦게, 심하면 몇 시간 간격으로
+실행될 수 있습니다. 짧은 간격(5~10분)일수록 이 지연이 심해지는 것이 GitHub 쪽 알려진
+한계라, 너무 짧게 잡아도 체감상 더 자주 도는 게 아닐 수 있습니다.
+
+한 번 실행에 걸리는 시간도 간격과 맞물립니다. `monitor.py`는 날짜 페이지를 한 번에
+`MONITOR_CONCURRENCY`개(기본 6개)씩 동시에 열어 확인합니다. 감시 병원·날짜 수가 많으면
+`.github/workflows/monitor.yml` 의 `Run monitor` 단계에 아래처럼 환경 변수를 추가해
+늘릴 수 있습니다 (단, 너무 크게 잡으면 러너 자원 부족으로 오히려 느려지거나 실패할 수 있음).
+
+```yaml
+      - name: Run monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ALWAYS_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          MONITOR_CONCURRENCY: '6'
+        run: python monitor.py
+```
 
 ## 동작 확인 방법
 
