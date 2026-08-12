@@ -28,7 +28,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Chromium for Playwright
+      - name: Cache Playwright browser binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      # 브라우저 파일 자체는 위 캐시가 있으면 재다운로드를 건너뛴다.
+      # 단, 실행기(VM)는 매번 새로 뜨므로 OS 라이브러리(install-deps)는 캐시와 무관하게 항상 설치해야 한다.
+      - name: Install Chromium (browser + OS libraries)
         run: python -m playwright install --with-deps chromium
 
       - name: Run monitor
