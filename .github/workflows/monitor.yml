@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/20 * * * *'
   workflow_dispatch:
+    inputs:
+      always_notify:
+        description: '빈자리가 없어도 점검 메시지 보내기'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -42,7 +47,7 @@ jobs:
       - name: Run monitor
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          ALWAYS_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          ALWAYS_NOTIFY: ${{ github.event.inputs.always_notify == 'true' && '1' || '0' }}
         run: python monitor.py
 
       - name: Upload debug bundle
