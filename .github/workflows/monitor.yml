@@ -2,7 +2,7 @@ name: Hospital Booking Monitor
 
 on:
   schedule:
-    - cron: '*/20 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       always_notify:
